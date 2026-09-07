@@ -375,17 +375,52 @@ async fn launch(
 }
 
 async fn try_get_gpu_envs(gpu: GpuPreference) -> Option<HashMap<String, String>> {
+    if matches!(gpu, GpuPreference::Default) {
+        return None;
+    }
+
     let connection = zbus::Connection::system().await.ok()?;
     let proxy = switcheroo_control::SwitcherooControlProxy::new(&connection)
         .await
         .ok()?;
     let gpus = proxy.get_gpus().await.ok()?;
-    match gpu {
-        GpuPreference::Default => gpus.into_iter().find(|gpu| gpu.default),
-        GpuPreference::NonDefault => gpus.into_iter().find(|gpu| !gpu.default),
-        GpuPreference::SpecificIdx(idx) => gpus.into_iter().nth(idx as usize),
+    let gpu_idx = match gpu {
+        GpuPreference::Default => automatic_gpu_idx(&gpus, false),
+        GpuPreference::NonDefault => automatic_gpu_idx(&gpus, true),
+        GpuPreference::SpecificIdx(idx) => Some(idx as usize),
+    }?;
+    gpus.into_iter().nth(gpu_idx).map(|gpu| gpu.environment)
+}
+
+fn preferred_gpu_idx(gpus: &[switcheroo_control::Gpu], prefers_discrete: bool) -> Option<usize> {
+    if prefers_discrete {
+        gpus.iter()
+            .position(|gpu| gpu.default && gpu.discrete)
+            .or_else(|| gpus.iter().position(|gpu| gpu.discrete))
+            .or_else(|| gpus.iter().position(|gpu| !gpu.default))
+    } else {
+        gpus.iter().position(|gpu| gpu.default)
     }
-    .map(|gpu| gpu.environment)
+}
+
+fn automatic_gpu_idx(gpus: &[switcheroo_control::Gpu], prefers_discrete: bool) -> Option<usize> {
+    if !prefers_discrete || gpus.iter().any(|gpu| gpu.default && gpu.discrete) {
+        None
+    } else {
+        preferred_gpu_idx(gpus, true)
+    }
+}
+
+fn desktop_gpu_preference(
+    plugin_preference: GpuPreference,
+    prefers_discrete: bool,
+) -> GpuPreference {
+    match plugin_preference {
+        specific @ GpuPreference::SpecificIdx(_) => specific,
+        GpuPreference::NonDefault => GpuPreference::NonDefault,
+        GpuPreference::Default if prefers_discrete => GpuPreference::NonDefault,
+        GpuPreference::Default => GpuPreference::Default,
+    }
 }
 
 impl cosmic::Application for CosmicLauncher {
@@ -571,6 +606,8 @@ impl cosmic::Application for CosmicLauncher {
                         action_name,
                     } => {
                         if let Some(entry) = cosmic::desktop::load_desktop_file(&[], path) {
+                            let gpu_preference =
+                                desktop_gpu_preference(gpu_preference, entry.prefers_dgpu);
                             let exec = if let Some(action_name) = action_name {
                                 entry
                                     .desktop_actions
